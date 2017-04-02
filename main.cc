@@ -7,6 +7,7 @@
 #include <QDataStream>
 #include <QByteArray>
 #include <QString>
+#include <QTimer>
 
 #include "main.hh"
 
@@ -20,6 +21,7 @@ ChatDialog * ui;
 int portMin;
 int portMax;
 
+int ourPort;
 int senderPort;
 
 // RUMOR PROTOCOL RELATED GLOBVARS
@@ -42,7 +44,14 @@ QByteArray serializeRumor(QString);
 QByteArray serializeStatus();
 QVariantMap deserializeToMap(QByteArray);
 
-bool sendDatagram(QByteArray);
+QByteArray reserializeRumor(QMap<QString, QVariant>);
+
+bool sendDatagram(QByteArray); // sends to all
+bool sendDatagramToNeighbor(QByteArray); // sends only to a neighbor (used to rumermonger)
+bool sendDatagramBack(QByteArray); // sends only to a neighbor (used to rumermonger)
+
+void passOnRumor(QMap<QString, QVariant>);
+void sendBackStatus();
 
 // helper function for printing bytestreams from http://stackoverflow.com/questions/12209046/how-do-i-see-the-contents-of-qt-objects-qbytearray-during-debugging
 QString toDebug(const QByteArray & line) {
@@ -60,11 +69,15 @@ QString toDebug(const QByteArray & line) {
     return s;
 }
 
+// ****************************************************************************
+// ASSEMBLY FUNCTIONS
+// ****************************************************************************
+
 // function to assemble rumor messages using message text
 QMap<QString, QVariant> assemble_rumor(QString message_text) {
 	QMap<QString, QVariant> rumor;
 	rumor.insert("ChatText", message_text);
-	rumor.insert("Origin", QString::number(senderPort));
+	rumor.insert("Origin", QString::number(ourPort));
 	rumor.insert("SeqNo", sequenceNum);
 
 	sequenceNum++; // move sequence number forward
@@ -80,6 +93,10 @@ QMap<QString, QMap<QString, quint32> > assemble_status() {
 	return status;
 }
 
+// ****************************************************************************
+// SERIALIZATION AND DESERIALIZATION FUNCTIONS
+// ****************************************************************************
+
 QByteArray serializeRumor(QString message_text) {
 	QMap<QString, QVariant> message_map = assemble_rumor(message_text);
 
@@ -87,6 +104,16 @@ QByteArray serializeRumor(QString message_text) {
 	QDataStream * stream = new QDataStream(&data, QIODevice::WriteOnly);
 
 	(*stream) << message_map;
+	delete stream;
+
+	return data;
+}
+
+QByteArray reserializeRumor(QMap<QString, QVariant> rumor) {
+	QByteArray data;
+	QDataStream * stream = new QDataStream(&data, QIODevice::WriteOnly);
+
+	(*stream) << rumor;
 	delete stream;
 
 	return data;
@@ -113,6 +140,10 @@ QVariantMap deserializeToMap(QByteArray data) {
 	return message_map;
 }
 
+// ****************************************************************************
+// PARSE FUNCTIONS
+// ****************************************************************************
+
 void parseMapRecvd(QVariantMap map_recvd) {
 	if(map_recvd.contains("ChatText")) {
 		map_recvd = QMap<QString, QVariant>(map_recvd);
@@ -126,36 +157,41 @@ void parseMapRecvd(QVariantMap map_recvd) {
 	}
 }
 
-// void parseMapRecvd(QMap<QString, QMap<QString, quint32> > map_recvd) {
-// 	if(map_recvd.contains("Want")) {
-// 		qDebug() << map_recvd;
-// 		parseStatus(map_recvd);
-// 	}
-// 	else {
-// 		qDebug() << "Map is neither proper status nor rumor message";
-// 	}
-// }
-
 void parseRumor(QMap<QString, QVariant> rumor) {
+	bool newMessage = false;
 	// check for origin key
 	if(rumor.contains("Origin") && rumor.contains("SeqNo")) {
 		QString origin = rumor["Origin"].toString();
 		quint32 sequence = rumor["SeqNo"].toUInt();
-		// check to see if sending to itself
-		if(QString::number(senderPort) != origin) {
-			QString message_text = rumor["ChatText"].toString();
-			ui->appendString(QString(origin + ": " + message_text));
 
+		qDebug() << QString("Received rumor from origin " + origin);
+		// check to see if sending to itself
+		if(QString::number(ourPort) != origin) {
 			// we have received messages from this origin before, need to update sequence number
 			if(want_map.contains(origin)) {
+				if(sequence == want_map[origin]) {
+					newMessage = true;
+				}
 				want_map[origin] = sequence+1;
 			}
 			else { // add this origin to the table
+				newMessage = true;
 				want_map.insert(origin, sequence+1); // want the next message
 			}
 		}
 		else {
 			qDebug() << "Message is from myself, not printing";
+		}
+
+		// if the message is new
+		if(newMessage) {
+			// add to chat
+			QString message_text = rumor["ChatText"].toString();
+			ui->appendString(QString(origin + ": " + message_text));
+
+			passOnRumor(rumor);
+			sendSocket->waitForStatusResponse(rumor);
+			sendBackStatus();
 		}
 	}
 	else {
@@ -163,15 +199,87 @@ void parseRumor(QMap<QString, QVariant> rumor) {
 	}
 }
 
-// wrapper function
-// void parseStatus(QMap<QString, QMap<QString, quint32> > status) {
-// 	// QVariantMap convertit = QVariantMap(status);
-// 	// parseStatus(convertit);
-// }
+void passOnRumor(QMap<QString, QVariant> rumor) {
+	QByteArray rumorBytes = reserializeRumor(rumor);
+
+	bool rumorSendSuccess = sendDatagramToNeighbor(rumorBytes);
+
+	if (!rumorSendSuccess) {
+		qDebug() << "Rumor datagram failed to send, need to handle";
+	}
+}
 
 void parseStatus(QVariantMap status) {
 	qDebug() << "Status parsing code";
 }
+
+// ****************************************************************************
+// SEND FUNCTIONS
+// ****************************************************************************
+
+bool sendDatagram(QByteArray data) {
+	int sent;
+	for (int port = portMin; port <= portMax; port++) {
+		sent = sendSocket->writeDatagram(data, QHostAddress::LocalHost, port);
+
+		if(sent == -1) return false; // error code
+	}
+	return true;
+}
+
+bool sendDatagramToNeighbor(QByteArray data) {
+	int sent;
+
+	int neighborPort;
+
+	if(senderPort == portMin) {
+		neighborPort = senderPort + 1;
+	}
+	else if (senderPort == portMax) {
+		neighborPort = senderPort - 1;
+	}
+	else {
+		if(qrand() > .5*RAND_MAX) {
+			neighborPort = senderPort + 1;
+		}
+		else {
+			neighborPort = senderPort - 1;
+		}
+	}
+
+	sent = sendSocket->writeDatagram(data, QHostAddress::LocalHost, neighborPort);
+
+	if(sent == -1) return false; // error code
+
+	qDebug() << QString("Successfully rumormongered message to neighbor on port " + QString::number(neighborPort));
+
+	return true;
+}
+
+bool sendDatagramBack(QByteArray data) {
+	int sent;
+
+	sent = sendSocket->writeDatagram(data, QHostAddress::LocalHost, senderPort);
+
+	if(sent == -1) return false; // error code
+
+	qDebug() << QString("Sent back status to sender at port " + QString::number(senderPort));
+
+	return true;
+}
+
+void sendBackStatus() {
+	QByteArray statusToSend = serializeStatus();
+	bool statusSendSuccess = sendDatagramBack(statusToSend);
+
+	if (!statusSendSuccess) {
+		qDebug() << "Status datagram failed to send, need to handle";
+	}
+}
+
+// ****************************************************************************
+// CHAT UI FUNCTIONS
+// ****************************************************************************
 
 ChatDialog::ChatDialog()
 {
@@ -204,22 +312,18 @@ ChatDialog::ChatDialog()
 		this, SLOT(gotReturnPressed()));
 }
 
+// RETURN KEY HANDLER
 void ChatDialog::gotReturnPressed()
 {
-	textview->append(QString::number(senderPort) + ": " + textline->text());
+	textview->append(QString::number(ourPort) + ": " + textline->text());
 
 	QString message_text = textline->text(); // get message text
 	QByteArray rumorToSend = serializeRumor(message_text); // serialize into bytestream
-	QByteArray statusToSend = serializeStatus();
 
 	bool rumorSendSuccess = sendDatagram(rumorToSend);
-	bool statusSendSuccess = sendDatagram(statusToSend);
 
 	if (!rumorSendSuccess) {
 		qDebug() << "Rumor datagram failed to send, need to handle";
-	}
-	if (!statusSendSuccess) {
-		qDebug() << "Status datagram failed to send, need to handle";
 	}
 
 	// Clear the textline to get ready for the next input message.
@@ -229,6 +333,10 @@ void ChatDialog::gotReturnPressed()
 void ChatDialog::appendString(QString str) {
 	textview->append(str);
 }
+
+// ****************************************************************************
+// SOCKET STUFF
+// ****************************************************************************
 
 NetSocket::NetSocket()
 {
@@ -253,9 +361,11 @@ void NetSocket::recvDatagram() {
          QByteArray datagram;
          datagram.resize(sendSocket->pendingDatagramSize());
          QHostAddress sender;
-         quint16 senderPort;
+         quint16 temp;
 
-         sendSocket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
+         sendSocket->readDatagram(datagram.data(), datagram.size(), &sender, &temp);
+
+		 senderPort = int(temp);
 
 		 // deserialize the byte array to a map
 		 QMap<QString, QVariant> deserialized = deserializeToMap(datagram);
@@ -275,9 +385,12 @@ bool NetSocket::bind()
 	for (int p = myPortMin; p <= myPortMax; p++) {
 		if (QUdpSocket::bind(p)) {
 			qDebug() << "bound to UDP port " << p;
-			senderPort = p;
+			ourPort = p;
 			// connect receive signal to readDatagram signal handler
 			connect(this, SIGNAL(readyRead()), this, SLOT(recvDatagram()));
+
+			timer = new QTimer(this);
+			connect(timer, SIGNAL(timeout()), this, SLOT(timeoutHandler()));
 			return true;
 		}
 	}
@@ -287,14 +400,11 @@ bool NetSocket::bind()
 	return false;
 }
 
-bool sendDatagram(QByteArray data) {
-	int sent;
-	for (int port = portMin; port <= portMax; port++) {
-		sent = sendSocket->writeDatagram(data, QHostAddress::LocalHost, port);
+void NetSocket::waitForStatusResponse(QMap<QString, QVariant> rumor) {
+    timer->start(1000);
+}
 
-		if(sent == -1) return false; // error code
-	}
-	return true;
+void NetSocket::timeoutHandler() {
 }
 
 int main(int argc, char **argv)

@@ -6,6 +6,7 @@
 #include <QLineEdit>
 #include <QUdpSocket>
 #include <QMap>
+#include <QTimer>
 
 class ChatDialog : public QDialog
 {
@@ -32,12 +33,15 @@ public:
 
 	// Bind this socket to a P2Papp-specific default port.
 	bool bind();
+	void waitForStatusResponse(QMap<QString, QVariant> rumor);
 
 public slots:
 	void recvDatagram();
+	void timeoutHandler();
 
 private:
 	int myPortMin, myPortMax;
+	QTimer * timer;
 };
 
 #endif // P2PAPP_MAIN_HH
