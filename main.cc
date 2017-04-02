@@ -6,11 +6,13 @@
 #include <QMap>
 #include <QDataStream>
 #include <QByteArray>
+#include <QString>
 
 #include "main.hh"
 
 using namespace std;
 
+// SENDER GLOBAL VARIABLES
 
 NetSocket * sendSocket;
 ChatDialog * ui;
@@ -20,10 +22,27 @@ int portMax;
 
 int senderPort;
 
-QByteArray serializeMessage(QString);
-QMap<QString, QString> deserializeToMap(QByteArray);
+// RUMOR PROTOCOL RELATED GLOBVARS
+quint32 sequenceNum;
+QMap<QString, quint32> want_map; // for keeping track of wants
+
+// HELPER FUNCTIONS
+// sender side
+QMap<QString, QVariant> assemble_rumor(QString);
+QMap<QString, QMap<QString, quint32> > assemble_status();
+
+// receiver side
+void parseMapRecvd(QMap<QString, QVariant>);
+void parseMapRecvd(QMap<QString, QMap<QString, quint32> >);
+void parseRumor(QMap<QString, QVariant>);
+void parseStatus(QMap<QString, QMap<QString, quint32> >);
+void parseStatus(QVariantMap);
+
+QByteArray serializeRumor(QString);
+QByteArray serializeStatus();
+QVariantMap deserializeToMap(QByteArray);
+
 bool sendDatagram(QByteArray);
-void recvDatagram();
 
 // helper function for printing bytestreams from http://stackoverflow.com/questions/12209046/how-do-i-see-the-contents-of-qt-objects-qbytearray-during-debugging
 QString toDebug(const QByteArray & line) {
@@ -41,17 +60,28 @@ QString toDebug(const QByteArray & line) {
     return s;
 }
 
-QByteArray serializeMessage(QString message_text) {
-	QString chattext_type = QString("ChatText");
-	QString sender_id_type = QString("SenderID");
+// function to assemble rumor messages using message text
+QMap<QString, QVariant> assemble_rumor(QString message_text) {
+	QMap<QString, QVariant> rumor;
+	rumor.insert("ChatText", message_text);
+	rumor.insert("Origin", QString::number(senderPort));
+	rumor.insert("SeqNo", sequenceNum);
 
-	QMap<QString, QString> message_map;
-	message_map.insert(chattext_type, message_text);
+	sequenceNum++; // move sequence number forward
 
-	QString sender = QString(senderPort);
-	message_map.insert(sender_id_type, sender);
+	return rumor;
+}
 
-	qDebug() << message_map;
+// function to assemble status messages
+QMap<QString, QMap<QString, quint32> > assemble_status() {
+	QMap<QString, QMap<QString, quint32> > status;
+	status.insert("Want", want_map);
+
+	return status;
+}
+
+QByteArray serializeRumor(QString message_text) {
+	QMap<QString, QVariant> message_map = assemble_rumor(message_text);
 
 	QByteArray data;
 	QDataStream * stream = new QDataStream(&data, QIODevice::WriteOnly);
@@ -62,13 +92,85 @@ QByteArray serializeMessage(QString message_text) {
 	return data;
 }
 
-QMap<QString, QString> deserializeToMap(QByteArray data) {
-	QMap<QString, QString> message_map;
+QByteArray serializeStatus() {
+	QMap<QString, QMap<QString, quint32> > message_map = assemble_status();
+
+	QByteArray data;
+	QDataStream * stream = new QDataStream(&data, QIODevice::WriteOnly);
+
+	(*stream) << message_map;
+	delete stream;
+
+	return data;
+}
+
+QVariantMap deserializeToMap(QByteArray data) {
+	QVariantMap message_map;
 
 	QDataStream stream(&data, QIODevice::ReadOnly);
 	stream >> message_map;
 
 	return message_map;
+}
+
+void parseMapRecvd(QVariantMap map_recvd) {
+	if(map_recvd.contains("ChatText")) {
+		map_recvd = QMap<QString, QVariant>(map_recvd);
+		parseRumor(map_recvd);
+	}
+	else if(map_recvd.contains("Want")) {
+		parseStatus(map_recvd);
+	}
+	else {
+		qDebug() << "Map is neither proper status nor rumor message";
+	}
+}
+
+// void parseMapRecvd(QMap<QString, QMap<QString, quint32> > map_recvd) {
+// 	if(map_recvd.contains("Want")) {
+// 		qDebug() << map_recvd;
+// 		parseStatus(map_recvd);
+// 	}
+// 	else {
+// 		qDebug() << "Map is neither proper status nor rumor message";
+// 	}
+// }
+
+void parseRumor(QMap<QString, QVariant> rumor) {
+	// check for origin key
+	if(rumor.contains("Origin") && rumor.contains("SeqNo")) {
+		QString origin = rumor["Origin"].toString();
+		quint32 sequence = rumor["SeqNo"].toUInt();
+		// check to see if sending to itself
+		if(QString::number(senderPort) != origin) {
+			QString message_text = rumor["ChatText"].toString();
+			ui->appendString(QString(origin + ": " + message_text));
+
+			// we have received messages from this origin before, need to update sequence number
+			if(want_map.contains(origin)) {
+				want_map[origin] = sequence+1;
+			}
+			else { // add this origin to the table
+				want_map.insert(origin, sequence+1); // want the next message
+			}
+		}
+		else {
+			qDebug() << "Message is from myself, not printing";
+		}
+	}
+	else {
+		qDebug() << "Missing SeqNo or Origin field";
+	}
+}
+
+// wrapper function
+// void parseStatus(QMap<QString, QMap<QString, quint32> > status) {
+// 	// QVariantMap convertit = QVariantMap(status);
+// 	// parseStatus(convertit);
+// }
+
+void parseStatus(QVariantMap status) {
+	qDebug() << "Status parsing code";
 }
 
 ChatDialog::ChatDialog()
@@ -104,39 +206,28 @@ ChatDialog::ChatDialog()
 
 void ChatDialog::gotReturnPressed()
 {
-	// Initially, just echo the string locally.
-	// Insert some networking code here...
-	qDebug() << "FIX: send message to other peers: " << textline->text();
-	textview->append(QString(senderPort) + ": " + textline->text());
+	textview->append(QString::number(senderPort) + ": " + textline->text());
 
+	QString message_text = textline->text(); // get message text
+	QByteArray rumorToSend = serializeRumor(message_text); // serialize into bytestream
+	QByteArray statusToSend = serializeStatus();
 
-	QString message_text = textline->text();
-	QByteArray test = serializeMessage(message_text);
+	bool rumorSendSuccess = sendDatagram(rumorToSend);
+	bool statusSendSuccess = sendDatagram(statusToSend);
 
-	cout << sendDatagram(test);
+	if (!rumorSendSuccess) {
+		qDebug() << "Rumor datagram failed to send, need to handle";
+	}
+	if (!statusSendSuccess) {
+		qDebug() << "Status datagram failed to send, need to handle";
+	}
 
 	// Clear the textline to get ready for the next input message.
 	textline->clear();
 }
 
-void ChatDialog::parseMapRecvd(QMap<QString, QString> map_recvd) {
-	if(map_recvd.contains("ChatText")) {
-		if(map_recvd.contains("SenderID")) {
-			if(QString(senderPort) != map_recvd["SenderID"]) {
-				QString message_text = map_recvd["ChatText"];
-				textview->append(map_recvd["SenderID"] + ": " + message_text);
-			}
-			else {
-				qDebug() << "Message is from myself, not printing";
-			}
-		}
-		else {
-			qDebug() << "No sender id sent";
-		}
-	}
-	else {
-		qDebug() << "No ChatText entry in map";
-	}
+void ChatDialog::appendString(QString str) {
+	textview->append(str);
 }
 
 NetSocket::NetSocket()
@@ -167,14 +258,16 @@ void NetSocket::recvDatagram() {
          sendSocket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
 
 		 // deserialize the byte array to a map
-		 QMap<QString, QString> deserialized = deserializeToMap(datagram);
+		 QMap<QString, QVariant> deserialized = deserializeToMap(datagram);
 
-		 qDebug() << deserialized;
-		 // call the UI's parsing algo
-		 ui->parseMapRecvd(deserialized);
+		 if (deserialized.empty()) {
+			 qDebug() << "Empty status map";
+		 }
+		 else {
+			 parseMapRecvd(deserialized);
+		 }
     }
 }
-
 
 bool NetSocket::bind()
 {
@@ -195,8 +288,11 @@ bool NetSocket::bind()
 }
 
 bool sendDatagram(QByteArray data) {
+	int sent;
 	for (int port = portMin; port <= portMax; port++) {
-		sendSocket->writeDatagram(data, QHostAddress::LocalHost, port);
+		sent = sendSocket->writeDatagram(data, QHostAddress::LocalHost, port);
+
+		if(sent == -1) return false; // error code
 	}
 	return true;
 }
@@ -217,6 +313,9 @@ int main(int argc, char **argv)
 
 	sendSocket = &sock; // setup send socket
 	ui = &dialog;
+
+	// set sequenceNum to 0 bc no messages sent yet
+	sequenceNum = 0;
 
 	// Enter the Qt main loop; everything else is event driven
 	return app.exec();

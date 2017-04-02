@@ -13,7 +13,7 @@ class ChatDialog : public QDialog
 
 public:
 	ChatDialog();
-	void parseMapRecvd(QMap<QString, QString>);
+	void appendString(QString str);
 
 public slots:
 	void gotReturnPressed();
