@@ -304,6 +304,17 @@ void parseStatus(QMap<QString, QMap<QString, quint32> > remoteStatus) {
 	}
 	else {
 		qDebug() << "Maps are in sync, no need to pass on";
+		if(qrand() > .5*RAND_MAX) { // continue rumormongering
+			QByteArray rumorBytes = reserializeRumor(rumorToResend);
+
+			bool rumorSendSuccess = sendDatagramToNeighbor(rumorBytes);
+
+			if (!rumorSendSuccess) {
+				qDebug() << "Rumor datagram failed to resend, need to handle";
+			}
+
+			sendSocket->resetTimer();
+		}
 	}
 }
 
@@ -538,6 +549,10 @@ void NetSocket::timeoutHandler() {
 		qDebug() << "Rumor datagram failed to resend, need to handle";
 	}
 
+	timer->start(1000);
+}
+
+void NetSocket::resetTimer() {
 	timer->start(1000);
 }
 

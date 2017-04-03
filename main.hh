@@ -34,6 +34,7 @@ public:
 	// Bind this socket to a P2Papp-specific default port.
 	bool bind();
 	void waitForStatusResponse(QMap<QString, QVariant> rumor);
+	void resetTimer();
 
 public slots:
 	void recvDatagram();
