@@ -38,10 +38,12 @@ public:
 public slots:
 	void recvDatagram();
 	void timeoutHandler();
+	void antientropyTimeoutHandler();
 
 private:
 	int myPortMin, myPortMax;
 	QTimer * timer;
+	QTimer * entropyTimer;
 };
 
 #endif // P2PAPP_MAIN_HH

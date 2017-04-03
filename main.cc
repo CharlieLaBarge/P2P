@@ -8,6 +8,7 @@
 #include <QByteArray>
 #include <QString>
 #include <QTimer>
+#include <QList>
 
 #include "main.hh"
 
@@ -23,10 +24,18 @@ int portMax;
 
 int ourPort;
 int senderPort;
+int portLastContacted;
+
+bool waitingForStatus;
+
+QMap<QString, QVariant> rumorToResend;
 
 // RUMOR PROTOCOL RELATED GLOBVARS
 quint32 sequenceNum;
 QMap<QString, quint32> want_map; // for keeping track of wants
+
+//
+QMap<QString, QMap<quint32, QMap<QString, QVariant> > > past_messages;
 
 // HELPER FUNCTIONS
 // sender side
@@ -38,17 +47,18 @@ void parseMapRecvd(QMap<QString, QVariant>);
 void parseMapRecvd(QMap<QString, QMap<QString, quint32> >);
 void parseRumor(QMap<QString, QVariant>);
 void parseStatus(QMap<QString, QMap<QString, quint32> >);
-void parseStatus(QVariantMap);
 
 QByteArray serializeRumor(QString);
 QByteArray serializeStatus();
 QVariantMap deserializeToMap(QByteArray);
+QMap<QString, QMap<QString, quint32> > deserializeToWantMap(QByteArray);
 
 QByteArray reserializeRumor(QMap<QString, QVariant>);
 
 bool sendDatagram(QByteArray); // sends to all
 bool sendDatagramToNeighbor(QByteArray); // sends only to a neighbor (used to rumermonger)
 bool sendDatagramBack(QByteArray); // sends only to a neighbor (used to rumermonger)
+bool sendDatagramToPort(QByteArray, int);
 
 void passOnRumor(QMap<QString, QVariant>);
 void sendBackStatus();
@@ -100,6 +110,22 @@ QMap<QString, QMap<QString, quint32> > assemble_status() {
 QByteArray serializeRumor(QString message_text) {
 	QMap<QString, QVariant> message_map = assemble_rumor(message_text);
 
+	if(past_messages.contains(QString::number(ourPort))) {
+		past_messages[QString::number(ourPort)].insert(message_map["SeqNo"].toUInt(), message_map);
+	}
+	else {
+		QMap<quint32, QMap<QString, QVariant> > newMap;
+		past_messages.insert(QString::number(ourPort), newMap);
+		past_messages[QString::number(ourPort)].insert(message_map["SeqNo"].toUInt(), message_map);
+	}
+
+	if(want_map.contains(QString::number(ourPort))) {
+		want_map[QString::number(ourPort)]++;
+	}
+	else {
+		want_map.insert(QString::number(ourPort), 1);
+	}
+
 	QByteArray data;
 	QDataStream * stream = new QDataStream(&data, QIODevice::WriteOnly);
 
@@ -140,6 +166,15 @@ QVariantMap deserializeToMap(QByteArray data) {
 	return message_map;
 }
 
+QMap<QString, QMap<QString, quint32> > deserializeToWantMap(QByteArray data) {
+	QMap<QString, QMap<QString, quint32> > message_map;
+
+	QDataStream stream(&data, QIODevice::ReadOnly);
+	stream >> message_map;
+
+	return message_map;
+}
+
 // ****************************************************************************
 // PARSE FUNCTIONS
 // ****************************************************************************
@@ -148,9 +183,6 @@ void parseMapRecvd(QVariantMap map_recvd) {
 	if(map_recvd.contains("ChatText")) {
 		map_recvd = QMap<QString, QVariant>(map_recvd);
 		parseRumor(map_recvd);
-	}
-	else if(map_recvd.contains("Want")) {
-		parseStatus(map_recvd);
 	}
 	else {
 		qDebug() << "Map is neither proper status nor rumor message";
@@ -180,8 +212,17 @@ void parseRumor(QMap<QString, QVariant> rumor) {
 			}
 		}
 		else {
+			// we have received messages from this origin before, need to update sequence number
+			if(want_map.contains(origin)) {
+				want_map[origin] = sequence+1;
+			}
+			else { // add this origin to the table
+				want_map.insert(origin, sequence+1); // want the next message
+			}
 			qDebug() << "Message is from myself, not printing";
 		}
+
+		sendBackStatus();
 
 		// if the message is new
 		if(newMessage) {
@@ -189,9 +230,17 @@ void parseRumor(QMap<QString, QVariant> rumor) {
 			QString message_text = rumor["ChatText"].toString();
 			ui->appendString(QString(origin + ": " + message_text));
 
+			if(past_messages.contains(origin)) {
+				past_messages[origin].insert(sequence, rumor);
+			}
+			else {
+				QMap<quint32, QMap<QString, QVariant> > newMap;
+				past_messages.insert(origin, newMap);
+				past_messages[origin].insert(sequence, rumor);
+			}
+
 			passOnRumor(rumor);
-			sendSocket->waitForStatusResponse(rumor);
-			sendBackStatus();
+			sendSocket->waitForStatusResponse(rumor); // timeout TODO
 		}
 	}
 	else {
@@ -209,8 +258,53 @@ void passOnRumor(QMap<QString, QVariant> rumor) {
 	}
 }
 
-void parseStatus(QVariantMap status) {
-	qDebug() << "Status parsing code";
+void parseStatus(QMap<QString, QMap<QString, quint32> > remoteStatus) {
+	bool inSync = true;
+	bool weAreAhead = false;
+	QMap<QString, QVariant> rumorToSend;
+
+	QMap<QString, quint32> remoteWant = remoteStatus["Want"];
+	QMap<QString, quint32>::iterator i;
+
+	qDebug() << "Remote want map is: " << remoteWant;
+	qDebug() << "Our want map is: " << want_map;
+
+	for (i = want_map.begin(); i != want_map.end(); ++i) {
+		if(remoteWant.contains(i.key())) {
+			if(remoteWant[i.key()] != want_map[i.key()]) {
+				if(remoteWant[i.key()] <= want_map[i.key()]) {
+					rumorToSend = past_messages[i.key()][remoteWant[i.key()]];
+					weAreAhead = true;
+				}
+				inSync = false;
+			}
+		}
+		else { // the remote host has never seen a particular origin's messages, start to catch him up
+			inSync = false;
+			rumorToSend = past_messages[i.key()][quint32(0)];
+			weAreAhead = true;
+		}
+	}
+
+	// go through their origins
+	for (i = remoteWant.begin(); i != remoteWant.end(); ++i) {
+		if(!want_map.contains(i.key())) { // if we're missing one of their origins
+			inSync = false;
+		}
+	}
+
+	if(!inSync && !weAreAhead) { // we need to send our status
+		qDebug() << "We're behind";
+		sendBackStatus();
+	}
+	else if(!inSync){ // send rumorToSend
+		qDebug() << "We're ahead, sending new rumor";
+		QByteArray temp = reserializeRumor(rumorToSend);
+		bool success = sendDatagramBack(temp);
+	}
+	else {
+		qDebug() << "Maps are in sync, no need to pass on";
+	}
 }
 
 // ****************************************************************************
@@ -232,18 +326,18 @@ bool sendDatagramToNeighbor(QByteArray data) {
 
 	int neighborPort;
 
-	if(senderPort == portMin) {
-		neighborPort = senderPort + 1;
+	if(ourPort == portMin) {
+		neighborPort = ourPort + 1;
 	}
-	else if (senderPort == portMax) {
-		neighborPort = senderPort - 1;
+	else if (ourPort == portMax) {
+		neighborPort = ourPort - 1;
 	}
 	else {
 		if(qrand() > .5*RAND_MAX) {
-			neighborPort = senderPort + 1;
+			neighborPort = ourPort + 1;
 		}
 		else {
-			neighborPort = senderPort - 1;
+			neighborPort = ourPort - 1;
 		}
 	}
 
@@ -252,6 +346,8 @@ bool sendDatagramToNeighbor(QByteArray data) {
 	if(sent == -1) return false; // error code
 
 	qDebug() << QString("Successfully rumormongered message to neighbor on port " + QString::number(neighborPort));
+
+	portLastContacted = neighborPort;
 
 	return true;
 }
@@ -263,7 +359,19 @@ bool sendDatagramBack(QByteArray data) {
 
 	if(sent == -1) return false; // error code
 
-	qDebug() << QString("Sent back status to sender at port " + QString::number(senderPort));
+	qDebug() << QString("Sent datagram to port " + QString::number(senderPort));
+
+	return true;
+}
+
+bool sendDatagramToPort(QByteArray data, int port) {
+	int sent;
+
+	sent = sendSocket->writeDatagram(data, QHostAddress::LocalHost, port);
+
+	if(sent == -1) return false; // error code
+
+	qDebug() << QString("Sent datagram to port " + QString::number(portLastContacted));
 
 	return true;
 }
@@ -313,14 +421,13 @@ ChatDialog::ChatDialog()
 }
 
 // RETURN KEY HANDLER
-void ChatDialog::gotReturnPressed()
-{
+void ChatDialog::gotReturnPressed() {
 	textview->append(QString::number(ourPort) + ": " + textline->text());
 
 	QString message_text = textline->text(); // get message text
 	QByteArray rumorToSend = serializeRumor(message_text); // serialize into bytestream
 
-	bool rumorSendSuccess = sendDatagram(rumorToSend);
+	bool rumorSendSuccess = sendDatagramToNeighbor(rumorToSend); // propagate rumor through the system
 
 	if (!rumorSendSuccess) {
 		qDebug() << "Rumor datagram failed to send, need to handle";
@@ -372,9 +479,20 @@ void NetSocket::recvDatagram() {
 
 		 if (deserialized.empty()) {
 			 qDebug() << "Empty status map";
+			 timer->stop();
+
+			 QMap<QString, QMap<QString, quint32> > newMap =  deserializeToWantMap(datagram);
+			 parseStatus(newMap);
 		 }
 		 else {
-			 parseMapRecvd(deserialized);
+			 if(deserialized.contains("Want")) {
+				 timer->stop();
+				 QMap<QString, QMap<QString, quint32> > newMap =  deserializeToWantMap(datagram);
+				 parseStatus(newMap);
+			 }
+			 else {
+				 parseMapRecvd(deserialized);
+			 }
 		 }
     }
 }
@@ -391,6 +509,11 @@ bool NetSocket::bind()
 
 			timer = new QTimer(this);
 			connect(timer, SIGNAL(timeout()), this, SLOT(timeoutHandler()));
+
+			entropyTimer = new QTimer(this);
+			connect(entropyTimer, SIGNAL(timeout()), this, SLOT(antientropyTimeoutHandler()));
+			entropyTimer->start(3000);
+
 			return true;
 		}
 	}
@@ -402,9 +525,31 @@ bool NetSocket::bind()
 
 void NetSocket::waitForStatusResponse(QMap<QString, QVariant> rumor) {
     timer->start(1000);
+	rumorToResend = rumor;
+	// waitingForStatus = true;
 }
 
 void NetSocket::timeoutHandler() {
+	QByteArray rumorBytes = reserializeRumor(rumorToResend);
+
+	bool rumorSendSuccess = sendDatagramToPort(rumorBytes, portLastContacted);
+
+	if (!rumorSendSuccess) {
+		qDebug() << "Rumor datagram failed to resend, need to handle";
+	}
+
+	timer->start(1000);
+}
+
+void NetSocket::antientropyTimeoutHandler() {
+	// qDebug() << "Antientropy timer expired, sending status to random neighbor";
+	QByteArray statusToSend = serializeStatus();
+	bool statusSendSuccess = sendDatagramToNeighbor(statusToSend);
+
+	if (!statusSendSuccess) {
+		// qDebug() << "Status datagram failed to send, need to handle";
+	}
+	entropyTimer->start(3000);
 }
 
 int main(int argc, char **argv)
